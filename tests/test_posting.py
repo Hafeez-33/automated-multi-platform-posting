@@ -198,3 +198,45 @@ def test_endpoint_validation_errors(invalid_payload, expected_error_substr):
     assert "detail" in data
     error_str = str(data["detail"])
     assert expected_error_substr in error_str
+
+
+# ==============================================================================
+# Unit Tests: BasePlatform Interface Contract
+# ==============================================================================
+
+def test_base_platform_cannot_be_instantiated_directly():
+    """Verify that BasePlatform is an abstract class and cannot be instantiated directly."""
+    from app.platforms.base import BasePlatform
+
+    with pytest.raises(TypeError) as exc_info:
+        BasePlatform()  # type: ignore
+    assert "Can't instantiate abstract class BasePlatform" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_concrete_platform_subclass_can_be_instantiated_and_executed():
+    """Verify that a concrete subclass implementing platform_name and publish() can be instantiated."""
+    from app.platforms.base import BasePlatform
+    from app.schemas import PlatformResult
+
+    class MockPlatform(BasePlatform):
+        platform_name = "MockPlatform"
+
+        async def publish(self, message: str, url: str) -> PlatformResult:
+            return PlatformResult(
+                platform=self.platform_name,
+                status="success",
+                posted_url=f"https://mock.platform.com/post?url={url}",
+                public_access=True,
+                error=None,
+            )
+
+    platform = MockPlatform()
+    assert platform.platform_name == "MockPlatform"
+
+    result = await platform.publish("Test message https://example.com", "https://example.com")
+    assert isinstance(result, PlatformResult)
+    assert result.platform == "MockPlatform"
+    assert result.status == "success"
+    assert result.public_access is True
+
