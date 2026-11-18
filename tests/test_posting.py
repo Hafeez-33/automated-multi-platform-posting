@@ -2591,6 +2591,179 @@ async def test_posting_service_exactly_five_results_for_valid_configurations():
     }
 
 
+# ==============================================================================
+# Endpoint Integration Tests: Stage 5.2 - FastAPI POST /posting Orchestration
+# ==============================================================================
+
+class _MockPostingServiceForEndpoint:
+    """Mock posting service to test endpoint orchestration and dependency injection."""
+
+    def __init__(self, response: Optional[PostingResponse] = None) -> None:
+        self.call_count = 0
+        self.called_message: Optional[str] = None
+        self.called_url: Optional[str] = None
+        self.response = response or PostingResponse(
+            success=True,
+            results=[
+                PlatformResult(
+                    platform=p,
+                    status="success",
+                    posted_url=f"https://{p.lower()}.example.com/post/1",
+                    public_access=True,
+                    date=datetime.date(2026, 11, 18),
+                    time=datetime.time(12, 0, 0),
+                    error=None,
+                )
+                for p in ("Telegram", "Discord", "Reddit", "LinkedIn", "Mastodon")
+            ],
+        )
+
+    async def post_to_all(self, message: str, url: str) -> PostingResponse:
+        self.call_count += 1
+        self.called_message = message
+        self.called_url = url
+        return self.response
+
+
+def test_endpoint_valid_post_calls_service_with_extracted_cta():
+    """Verify that POST /posting passes the message and extracted CTA URL to PostingService."""
+    from app.main import app, get_posting_service
+
+    mock_service = _MockPostingServiceForEndpoint()
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+
+    try:
+        raw_message = "Check out our new updates here: https://example.com/portal/login."
+        response = client.post("/posting", json={"message": raw_message})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["results"]) == 5
+        assert [r["platform"] for r in data["results"]] == [
+            "Telegram",
+            "Discord",
+            "Reddit",
+            "LinkedIn",
+            "Mastodon",
+        ]
+
+        # Verify exact parameters passed to the service
+        assert mock_service.call_count == 1
+        assert mock_service.called_message == raw_message
+        assert mock_service.called_url == "https://example.com/portal/login"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_endpoint_partial_platform_failures_returns_200():
+    """Verify that partial platform failures return HTTP 200 with success=False and all 5 results."""
+    from app.main import app, get_posting_service
+
+    mock_results = [
+        PlatformResult(platform="Telegram", status="success", posted_url="https://t.me/c/1"),
+        PlatformResult(platform="Discord", status="success", posted_url="https://discord.com/1"),
+        PlatformResult(platform="Reddit", status="failed", error="Reddit API rate limit exceeded"),
+        PlatformResult(platform="LinkedIn", status="success", posted_url=None),
+        PlatformResult(platform="Mastodon", status="failed", error="Instance connection refused"),
+    ]
+    mock_service = _MockPostingServiceForEndpoint(
+        response=PostingResponse(success=False, results=mock_results)
+    )
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+
+    try:
+        response = client.post("/posting", json={"message": "Broadcast https://example.com"})
+
+        assert response.status_code == 200  # Must be 200, never 500!
+        data = response.json()
+        assert data["success"] is False
+        assert len(data["results"]) == 5
+
+        statuses = {r["platform"]: r["status"] for r in data["results"]}
+        assert statuses["Telegram"] == "success"
+        assert statuses["Discord"] == "success"
+        assert statuses["Reddit"] == "failed"
+        assert statuses["LinkedIn"] == "success"
+        assert statuses["Mastodon"] == "failed"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_endpoint_all_platform_failures_returns_200():
+    """Verify that total platform failure returns HTTP 200 with success=False and all 5 failed results."""
+    from app.main import app, get_posting_service
+
+    all_failed_results = [
+        PlatformResult(platform=p, status="failed", error=f"{p} gateway down")
+        for p in ("Telegram", "Discord", "Reddit", "LinkedIn", "Mastodon")
+    ]
+    mock_service = _MockPostingServiceForEndpoint(
+        response=PostingResponse(success=False, results=all_failed_results)
+    )
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+
+    try:
+        response = client.post("/posting", json={"message": "All fail test https://example.com"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert len(data["results"]) == 5
+        assert all(r["status"] == "failed" for r in data["results"])
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_endpoint_validation_failure_does_not_call_service():
+    """Verify that validation failures (e.g. empty or multiple URLs) return 422 and never call PostingService."""
+    from app.main import app, get_posting_service
+
+    mock_service = _MockPostingServiceForEndpoint()
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+
+    try:
+        # 1. Empty message
+        resp1 = client.post("/posting", json={"message": ""})
+        assert resp1.status_code == 422
+
+        # 2. Exceeding 200 chars
+        resp2 = client.post("/posting", json={"message": "A" * 201 + " https://example.com"})
+        assert resp2.status_code == 422
+
+        # 3. Missing CTA link
+        resp3 = client.post("/posting", json={"message": "No link provided here"})
+        assert resp3.status_code == 422
+
+        # 4. Multiple CTA links
+        resp4 = client.post("/posting", json={"message": "https://a.com and https://b.com"})
+        assert resp4.status_code == 422
+
+        # 5. Invalid URL scheme
+        resp5 = client.post("/posting", json={"message": "Download at ftp://example.com/file"})
+        assert resp5.status_code == 422
+
+        # Ensure service was never invoked for any 422 request
+        assert mock_service.call_count == 0
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_endpoint_dependency_override_cleanup():
+    """Verify that dependency override cleanup properly restores original provider."""
+    from app.main import app, get_posting_service
+
+    assert get_posting_service not in app.dependency_overrides
+
+    mock_service = _MockPostingServiceForEndpoint()
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+    assert get_posting_service in app.dependency_overrides
+
+    app.dependency_overrides.clear()
+    assert get_posting_service not in app.dependency_overrides
+
+
+
 
 
 
