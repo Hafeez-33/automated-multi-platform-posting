@@ -259,7 +259,7 @@ def test_settings_load_defaults_without_credentials():
     # Sensible platform defaults
     assert test_settings.REDDIT_USER_AGENT == "AutomatedPoster/1.0.0"
     assert test_settings.REDDIT_SUBREDDIT == "test"
-    assert test_settings.LINKEDIN_VERSION == "202411"
+    assert test_settings.LINKEDIN_VERSION == "202611"
     assert test_settings.MASTODON_INSTANCE_URL == "https://mastodon.social"
 
     # Missing optional credentials must default to None without causing errors
@@ -276,20 +276,68 @@ def test_settings_load_defaults_without_credentials():
 
 
 def test_settings_override_via_arguments():
-    """Verify that settings can be customized through environment or constructor parameters."""
+    """Verify that settings can be customized through constructor parameters."""
     from app.config import Settings
 
     custom_settings = Settings(
         _env_file=None,
-        LINKEDIN_VERSION="202501",
+        LINKEDIN_VERSION="202701",
         REDDIT_SUBREDDIT="dxora_announcements",
         TELEGRAM_CHAT_ID="@dxora_official",
         MASTODON_INSTANCE_URL="https://mstdn.io",
     )
 
-    assert custom_settings.LINKEDIN_VERSION == "202501"
+    assert custom_settings.LINKEDIN_VERSION == "202701"
     assert custom_settings.REDDIT_SUBREDDIT == "dxora_announcements"
     assert custom_settings.TELEGRAM_CHAT_ID == "@dxora_official"
     assert custom_settings.MASTODON_INSTANCE_URL == "https://mstdn.io"
+
+
+def test_settings_loaded_from_environment(monkeypatch):
+    """Verify that environment variables are correctly loaded into Settings."""
+    from app.config import Settings
+
+    monkeypatch.setenv("APP_ENV", "staging")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "mock_telegram_token_123")
+    monkeypatch.setenv("REDDIT_REFRESH_TOKEN", "mock_refresh_token_xyz")
+    monkeypatch.setenv("LINKEDIN_VERSION", "202706")
+
+    env_settings = Settings(_env_file=None)
+
+    assert env_settings.APP_ENV == "staging"
+    assert env_settings.TELEGRAM_BOT_TOKEN == "mock_telegram_token_123"
+    assert env_settings.REDDIT_REFRESH_TOKEN == "mock_refresh_token_xyz"
+    assert env_settings.LINKEDIN_VERSION == "202706"
+
+
+def test_reddit_credentials_exclude_username_and_password():
+    """Verify that REDDIT_USERNAME and REDDIT_PASSWORD are not part of the Settings model."""
+    from app.config import Settings
+
+    assert "REDDIT_USERNAME" not in Settings.model_fields
+    assert "REDDIT_PASSWORD" not in Settings.model_fields
+
+    test_settings = Settings(_env_file=None)
+    assert not hasattr(test_settings, "REDDIT_USERNAME")
+    assert not hasattr(test_settings, "REDDIT_PASSWORD")
+
+
+def test_linkedin_version_is_configurable(monkeypatch):
+    """Verify that LINKEDIN_VERSION can be overridden via both env and constructor."""
+    from app.config import Settings
+
+    # Default
+    default_settings = Settings(_env_file=None)
+    assert default_settings.LINKEDIN_VERSION == "202611"
+
+    # Override via environment variable
+    monkeypatch.setenv("LINKEDIN_VERSION", "202501")
+    env_settings = Settings(_env_file=None)
+    assert env_settings.LINKEDIN_VERSION == "202501"
+
+    # Override via constructor argument
+    arg_settings = Settings(_env_file=None, LINKEDIN_VERSION="202712")
+    assert arg_settings.LINKEDIN_VERSION == "202712"
+
 
 

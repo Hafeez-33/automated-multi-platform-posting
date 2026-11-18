@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # 4. LinkedIn Configuration (REST Posts API)
     LINKEDIN_ACCESS_TOKEN: Optional[str] = None
     LINKEDIN_AUTHOR_URN: Optional[str] = None
-    LINKEDIN_VERSION: str = "202411"
+    LINKEDIN_VERSION: str = "202611"
 
     # 5. Mastodon Configuration (Decentralized Status API)
     MASTODON_INSTANCE_URL: str = "https://mastodon.social"
