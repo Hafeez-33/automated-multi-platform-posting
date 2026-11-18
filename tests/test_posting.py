@@ -928,6 +928,340 @@ async def test_discord_webhook_token_sanitization(monkeypatch):
     assert "[REDACTED_DISCORD" in result.error
 
 
+# ==============================================================================
+# Unit Tests: RedditPlatform Integration (Mocked HTTPX)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_reddit_missing_credentials():
+    """Verify that RedditPlatform fails gracefully when credentials are not configured."""
+    from app.platforms.reddit import RedditPlatform
+
+    platform = RedditPlatform(
+        client_id=None,
+        client_secret=None,
+        refresh_token=None,
+        access_token=None,
+    )
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Reddit"
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date is None
+    assert result.time is None
+    assert "Missing required credentials" in result.error
+
+
+@pytest.mark.asyncio
+async def test_reddit_successful_token_refresh_and_submission(monkeypatch):
+    """Verify successful OAuth token refresh followed by post submission."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    token_url_called = False
+    submit_url_called = False
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal token_url_called, submit_url_called
+        if "access_token" in url:
+            token_url_called = True
+            assert kwargs.get("auth") == ("test_client_id", "test_client_secret")
+            assert kwargs.get("data", {}).get("grant_type") == "refresh_token"
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "access_token": "mocked_reddit_access_token_123",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "scope": "submit identity",
+                },
+                request=httpx.Request("POST", url),
+            )
+        elif "submit" in url:
+            submit_url_called = True
+            headers = kwargs.get("headers", {})
+            assert headers.get("Authorization") == "Bearer mocked_reddit_access_token_123"
+            payload = kwargs.get("data", {})
+            assert payload.get("sr") == "test"
+            assert payload.get("kind") == "self"
+            assert "https://example.com" in payload.get("text")
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "json": {
+                        "errors": [],
+                        "data": {
+                            "url": "https://www.reddit.com/r/test/comments/1gxabc/online_platform_announcement/",
+                            "id": "1gxabc",
+                            "name": "t3_1gxabc",
+                            "created_utc": 1731931200,
+                        },
+                    }
+                },
+                request=httpx.Request("POST", url),
+            )
+        raise RuntimeError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        refresh_token="test_refresh_token",
+        access_token=None,
+        subreddit="r/test",
+    )
+    result = await platform.publish(
+        message="Online Platform Announcement\nCheck out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert token_url_called is True
+    assert submit_url_called is True
+    assert result.platform == "Reddit"
+    assert result.status == "success"
+    assert result.posted_url == "https://www.reddit.com/r/test/comments/1gxabc/online_platform_announcement/"
+    assert result.public_access is True
+    assert result.date == datetime.date(2024, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_successful_direct_token_submission(monkeypatch):
+    """Verify that providing REDDIT_ACCESS_TOKEN skips token refresh and submits directly."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    token_refreshed = False
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal token_refreshed
+        if "access_token" in url:
+            token_refreshed = True
+            raise RuntimeError("Should not call token refresh when access_token is provided")
+        return httpx.Response(
+            status_code=200,
+            json={
+                "json": {
+                    "errors": [],
+                    "data": {
+                        "url": "https://www.reddit.com/r/test/comments/999/direct_token/",
+                        "id": "999",
+                    },
+                }
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        access_token="direct_access_token_xyz",
+        subreddit="test",
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert token_refreshed is False
+    assert result.status == "success"
+    assert result.posted_url == "https://www.reddit.com/r/test/comments/999/direct_token/"
+    assert result.public_access is True
+
+
+@pytest.mark.asyncio
+async def test_reddit_authentication_failure_during_token_refresh(monkeypatch):
+    """Verify that token refresh failure returns failed result with sanitized error."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    secret_key = "my_private_secret_key_88"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=401,
+            text=f"Unauthorized: Invalid client secret {secret_key}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        client_id="cid",
+        client_secret=secret_key,
+        refresh_token="ref_tok",
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Reddit authentication failed" in result.error
+    assert secret_key not in result.error
+    assert "[REDACTED_CREDENTIAL]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_reddit_api_rejection_errors(monkeypatch):
+    """Verify that Reddit API business-level rejection errors are captured."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        if "access_token" in url:
+            return httpx.Response(
+                status_code=200,
+                json={"access_token": "valid_token"},
+                request=httpx.Request("POST", url),
+            )
+        return httpx.Response(
+            status_code=200,
+            json={
+                "json": {
+                    "errors": [
+                        ["RATELIMIT", "You are doing that too much. Try again in 5 minutes.", "ratelimit"]
+                    ]
+                }
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        access_token="valid_token",
+        subreddit="test",
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Reddit API rejection" in result.error
+    assert "You are doing that too much" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_network_error(monkeypatch):
+    """Verify that network errors during Reddit requests are handled gracefully."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.ConnectError("Failed to reach Reddit gateway", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(access_token="tok", subreddit="test")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Reddit network error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_reddit_request_timeout(monkeypatch):
+    """Verify that timeouts during Reddit requests return a clean failure result."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.TimeoutException("Reddit connection timed out")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(access_token="tok", subreddit="test")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert result.error == "Reddit request timed out."
+
+
+@pytest.mark.asyncio
+async def test_reddit_malformed_api_response(monkeypatch):
+    """Verify that unexpected response formats missing 'json' root are trapped."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={"unexpected": "structure"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(access_token="tok", subreddit="test")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Missing 'json' root object" in result.error
+
+
+@pytest.mark.asyncio
+async def test_reddit_missing_post_url_in_response(monkeypatch):
+    """Verify that responses missing the post URL fail cleanly without guessing URLs."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "json": {
+                    "errors": [],
+                    "data": {
+                        "id": "abc123",
+                        # url omitted
+                    },
+                }
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(access_token="tok", subreddit="test")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "did not provide a published post URL" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_token_and_secret_sanitization(monkeypatch):
+    """Verify that refresh token and client secret are scrubbed from error messages."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    secret_key = "super_classified_secret_key"
+    refresh_tok = "super_classified_refresh_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.RequestError(
+            f"Error occurred with secret={secret_key} and refresh={refresh_tok}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        client_id="cid",
+        client_secret=secret_key,
+        refresh_token=refresh_tok,
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert secret_key not in result.error
+    assert refresh_tok not in result.error
+    assert "[REDACTED_CREDENTIAL]" in result.error
+
+
+
 
 
 
