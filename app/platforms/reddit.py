@@ -9,6 +9,19 @@ from app.platforms.base import BasePlatform
 from app.schemas import PlatformResult
 
 
+def normalize_subreddit(sr: Optional[str]) -> str:
+    """
+    Trim whitespace and remove only an exact leading 'r/' prefix if present,
+    preserving subreddits starting with the letter 'r' (e.g. 'rust' or 'reactjs').
+    """
+    if not sr:
+        return "test"
+    cleaned = sr.strip()
+    if cleaned.lower().startswith("r/"):
+        return cleaned[2:]
+    return cleaned
+
+
 class RedditPlatform(BasePlatform):
     """Platform adapter for publishing text posts to Reddit via OAuth 2.0."""
 
@@ -35,11 +48,14 @@ class RedditPlatform(BasePlatform):
         """Human-readable platform name."""
         return "Reddit"
 
-    def _sanitize_error(self, message: str) -> str:
-        """Ensure client secrets, refresh tokens, and access tokens are never exposed in error text."""
+    def _sanitize_error(self, message: str, active_token: Optional[str] = None) -> str:
+        """
+        Ensure client secrets, refresh tokens, and both configured and newly generated
+        access tokens are never exposed in error text.
+        """
         sanitized = message
-        for secret in (self.client_secret, self.refresh_token, self.access_token):
-            if secret and secret in sanitized:
+        for secret in (self.client_secret, self.refresh_token, self.access_token, active_token):
+            if secret and secret.strip() and secret in sanitized:
                 sanitized = sanitized.replace(secret, "[REDACTED_CREDENTIAL]")
         return sanitized
 
@@ -114,7 +130,7 @@ class RedditPlatform(BasePlatform):
                 ),
             )
 
-        target_sr = (self.subreddit or "test").lstrip("r/").strip()
+        target_sr = normalize_subreddit(self.subreddit)
         if not target_sr:
             return PlatformResult(
                 platform=self.platform_name,
@@ -141,11 +157,13 @@ class RedditPlatform(BasePlatform):
             "send_replies": "true",
         }
 
+        active_token: Optional[str] = None
+
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # 2. Obtain access token
                 try:
-                    token = await self._obtain_access_token(client)
+                    active_token = await self._obtain_access_token(client)
                 except httpx.HTTPStatusError as auth_http_err:
                     err_msg = auth_http_err.response.text or f"HTTP {auth_http_err.response.status_code}"
                     return PlatformResult(
@@ -156,7 +174,8 @@ class RedditPlatform(BasePlatform):
                         date=None,
                         time=None,
                         error=self._sanitize_error(
-                            f"Reddit authentication failed: HTTP {auth_http_err.response.status_code} - {err_msg}"
+                            f"Reddit authentication failed: HTTP {auth_http_err.response.status_code} - {err_msg}",
+                            active_token=active_token,
                         ),
                     )
                 except Exception as auth_err:
@@ -167,12 +186,15 @@ class RedditPlatform(BasePlatform):
                         public_access=False,
                         date=None,
                         time=None,
-                        error=self._sanitize_error(f"Reddit authentication failed: {auth_err}"),
+                        error=self._sanitize_error(
+                            f"Reddit authentication failed: {auth_err}",
+                            active_token=active_token,
+                        ),
                     )
 
                 # 3. Submit post to Reddit
                 headers = {
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {active_token}",
                     "User-Agent": self.user_agent or "AutomatedPoster/1.0.0",
                 }
                 response = await client.post(submit_url, data=payload, headers=headers)
@@ -189,7 +211,10 @@ class RedditPlatform(BasePlatform):
                     public_access=False,
                     date=None,
                     time=None,
-                    error=f"Reddit unexpected response: Failed to parse JSON ({json_err}).",
+                    error=self._sanitize_error(
+                        f"Reddit unexpected response: Failed to parse JSON ({json_err}).",
+                        active_token=active_token,
+                    ),
                 )
 
             if not isinstance(data, dict) or "json" not in data:
@@ -200,7 +225,10 @@ class RedditPlatform(BasePlatform):
                     public_access=False,
                     date=None,
                     time=None,
-                    error="Reddit unexpected response: Missing 'json' root object.",
+                    error=self._sanitize_error(
+                        "Reddit unexpected response: Missing 'json' root object.",
+                        active_token=active_token,
+                    ),
                 )
 
             json_body = data["json"]
@@ -217,7 +245,10 @@ class RedditPlatform(BasePlatform):
                     public_access=False,
                     date=None,
                     time=None,
-                    error=self._sanitize_error(f"Reddit API rejection: {err_details}"),
+                    error=self._sanitize_error(
+                        f"Reddit API rejection: {err_details}",
+                        active_token=active_token,
+                    ),
                 )
 
             post_data = json_body.get("data", {})
@@ -230,7 +261,10 @@ class RedditPlatform(BasePlatform):
                     public_access=False,
                     date=None,
                     time=None,
-                    error="Reddit response did not provide a published post URL.",
+                    error=self._sanitize_error(
+                        "Reddit response did not provide a published post URL.",
+                        active_token=active_token,
+                    ),
                 )
 
             # Publication timestamp: parse if returned by Reddit, otherwise None
@@ -249,8 +283,8 @@ class RedditPlatform(BasePlatform):
                     pub_date = None
                     pub_time = None
 
-            # Public access evaluation: public subreddit posts are accessible to the public
-            public_access = True
+            # Conservative public access reporting: do not assume public visibility without external verification
+            public_access = False
 
             return PlatformResult(
                 platform=self.platform_name,
@@ -285,7 +319,10 @@ class RedditPlatform(BasePlatform):
                 public_access=False,
                 date=None,
                 time=None,
-                error=self._sanitize_error(f"Reddit HTTP {exc.response.status_code} error: {error_desc}"),
+                error=self._sanitize_error(
+                    f"Reddit HTTP {exc.response.status_code} error: {error_desc}",
+                    active_token=active_token,
+                ),
             )
         except httpx.RequestError as exc:
             return PlatformResult(
@@ -295,7 +332,10 @@ class RedditPlatform(BasePlatform):
                 public_access=False,
                 date=None,
                 time=None,
-                error=self._sanitize_error(f"Reddit network error: {type(exc).__name__} - {exc}"),
+                error=self._sanitize_error(
+                    f"Reddit network error: {type(exc).__name__} - {exc}",
+                    active_token=active_token,
+                ),
             )
         except Exception as exc:
             return PlatformResult(
@@ -305,5 +345,8 @@ class RedditPlatform(BasePlatform):
                 public_access=False,
                 date=None,
                 time=None,
-                error=self._sanitize_error(f"Reddit unexpected error: {type(exc).__name__} - {exc}"),
+                error=self._sanitize_error(
+                    f"Reddit unexpected error: {type(exc).__name__} - {exc}",
+                    active_token=active_token,
+                ),
             )

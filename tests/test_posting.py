@@ -1026,7 +1026,7 @@ async def test_reddit_successful_token_refresh_and_submission(monkeypatch):
     assert result.platform == "Reddit"
     assert result.status == "success"
     assert result.posted_url == "https://www.reddit.com/r/test/comments/1gxabc/online_platform_announcement/"
-    assert result.public_access is True
+    assert result.public_access is False
     assert result.date == datetime.date(2024, 11, 18)
     assert result.time == datetime.time(12, 0, 0)
     assert result.error is None
@@ -1070,7 +1070,7 @@ async def test_reddit_successful_direct_token_submission(monkeypatch):
     assert token_refreshed is False
     assert result.status == "success"
     assert result.posted_url == "https://www.reddit.com/r/test/comments/999/direct_token/"
-    assert result.public_access is True
+    assert result.public_access is False
 
 
 @pytest.mark.asyncio
@@ -1259,6 +1259,61 @@ async def test_reddit_token_and_secret_sanitization(monkeypatch):
     assert secret_key not in result.error
     assert refresh_tok not in result.error
     assert "[REDACTED_CREDENTIAL]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_reddit_active_access_token_sanitization(monkeypatch):
+    """Verify that a newly generated access token from refresh flow is redacted if leaked in submission errors."""
+    import httpx
+    from app.platforms.reddit import RedditPlatform
+
+    refreshed_token = "newly_generated_bearer_token_abc999"
+
+    async def mock_post(self, url, *args, **kwargs):
+        if "access_token" in url:
+            return httpx.Response(
+                status_code=200,
+                json={"access_token": refreshed_token, "expires_in": 3600},
+                request=httpx.Request("POST", url),
+            )
+        # Simulate an HTTP error whose response body or request error text echoes the active token
+        raise httpx.RequestError(
+            f"Failed to post with Authorization: Bearer {refreshed_token}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = RedditPlatform(
+        client_id="cid",
+        client_secret="csecret",
+        refresh_token="reftok",
+        access_token=None,  # Forces refresh flow to generate active_token
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert refreshed_token not in result.error
+    assert "[REDACTED_CREDENTIAL]" in result.error
+
+
+def test_reddit_subreddit_normalization():
+    """Verify that normalize_subreddit strips only 'r/' prefix and preserves subreddits starting with 'r'."""
+    from app.platforms.reddit import normalize_subreddit
+
+    assert normalize_subreddit("r/test") == "test"
+    assert normalize_subreddit("R/TEST") == "TEST"
+    assert normalize_subreddit("  r/programming  ") == "programming"
+    assert normalize_subreddit("test") == "test"
+    # Ensure subreddits starting with 'r' are preserved and not stripped by character sets
+    assert normalize_subreddit("rust") == "rust"
+    assert normalize_subreddit("r/rust") == "rust"
+    assert normalize_subreddit("reactjs") == "reactjs"
+    assert normalize_subreddit("r/reactjs") == "reactjs"
+    assert normalize_subreddit("ruby") == "ruby"
+    assert normalize_subreddit("") == "test"
+    assert normalize_subreddit(None) == "test"
+
 
 
 
