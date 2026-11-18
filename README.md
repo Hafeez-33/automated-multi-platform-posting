@@ -1,6 +1,6 @@
 # Automated Multi-Platform Posting System
 
-A high-performance, asynchronous multi-platform social media publishing microservice built with **Python 3.12** and **FastAPI**. The system accepts promotional messages (up to 200 characters with a single Call-to-Action link) and broadcasts them concurrently to **Telegram**, **Discord**, **Reddit**, **LinkedIn**, and **Mastodon** via their official REST APIs.
+A modular, asynchronous multi-platform social media publishing microservice built with **Python 3.12** and **FastAPI**. The system accepts promotional messages (up to 200 characters with a single Call-to-Action link) and broadcasts them concurrently to **Telegram**, **Discord**, **Reddit**, **LinkedIn**, and **Mastodon** via their official REST APIs.
 
 ---
 
@@ -53,7 +53,7 @@ Publishing manually or sequentially is error-prone, slow, and causes cumulative 
 ## Key Features
 
 - **Strict Input Validation**: Pydantic v2 enforces a 200-character ceiling, validates domain syntax and HTTP/HTTPS schemes, and verifies the presence of exactly one Call-To-Action (CTA) URL.
-- **True Concurrent Publishing**: Executes all five network calls in parallel using Python's `asyncio` and `httpx.AsyncClient`. Total request duration is bounded by the single slowest platform rather than the sequential sum.
+- **Concurrent Publishing**: Executes platform network calls concurrently using Python's `asyncio` and `httpx.AsyncClient` rather than sequential execution.
 - **Complete Failure Isolation**: Two-tier error handling wraps each platform call. Exceptions in one platform adapter never abort or cascade into other adapters.
 - **Multi-Tier Credential Sanitization**: Telegram bot tokens, Discord webhook tokens, Reddit refresh/access tokens, LinkedIn access tokens, and Mastodon bearer tokens are automatically scrubbed from error logs and response payloads.
 - **Conservative Public Access Auditing**: Accurately reflects whether published content is verified as publicly reachable without user authentication, preventing false public claims on private channels or login-gated feeds.
@@ -379,6 +379,9 @@ curl -X POST "http://localhost:4000/posting" \
 
 ## Sample Response
 
+> [!NOTE]
+> This is a fictional illustrative example showing the expected response structure. The URLs, IDs, timestamps, and successful posting statuses are placeholders. They are not actual publishing results.
+
 ```json
 {
   "success": true,
@@ -462,12 +465,12 @@ The application employs a defense-in-depth failure isolation strategy:
 
 ## Concurrency Model
 
-Rather than executing platform API calls sequentially (which would accumulate latencies of 500ms + 400ms + 600ms + 800ms + 300ms &approx; 2.6 seconds), `PostingService` leverages Python's native asynchronous event loop:
+`PostingService` leverages Python's native asynchronous event loop to publish concurrently across all configured platforms:
 
-- All five platform tasks are dispatched concurrently via `asyncio.gather()`.
-- HTTP I/O is non-blocking via `httpx.AsyncClient`.
-- Total wall-clock time is bounded by the slowest single network roundtrip (e.g. &approx; 800ms).
-- Response ordering is deterministically sorted to prevent race-condition instability in client consumers.
+- **Concurrent Dispatch**: Platform tasks are dispatched simultaneously via `asyncio.gather()`.
+- **Non-Blocking I/O**: Network requests utilize `httpx.AsyncClient`.
+- **Theoretical Latency Illustration**: In a sequential design, total wall-clock time is the sum of each platform call (e.g., $T_1 + T_2 + T_3 + T_4 + T_5$). With concurrent execution, total wall-clock time is theoretically bounded by the single slowest platform network call ($\max(T_1, \dots, T_5)$). *Note: This is a conceptual illustration; actual latency depends on live network conditions, DNS resolution, and third-party API server response times.*
+- **Deterministic Ordering**: Regardless of which network call finishes first, results are deterministically ordered in the response to maintain consistent parsing.
 
 ---
 
@@ -476,12 +479,12 @@ Rather than executing platform API calls sequentially (which would accumulate la
 Run the complete test suite using pytest:
 
 ```powershell
-.\venv\Scripts\pytest -v
+.\venv\Scripts\pytest.exe -v
 ```
 
 To run with coverage reporting:
 ```powershell
-.\venv\Scripts\pytest -v --cov=app --cov-report=term-missing
+.\venv\Scripts\pytest.exe -v --cov=app --cov-report=term-missing
 ```
 
 > **Important Note on Testing Methodology**:
@@ -529,9 +532,9 @@ tests/test_posting.py ..........................                          [100%]
 ## Known Limitations
 
 1. **Text & Link Only**: Current implementation is tailored for text and link promotions; direct media uploads (images, videos, PDF attachments) are out of scope for this stage.
-2. **Token Lifespans**: LinkedIn OAuth access tokens expire every 60 days and must be re-issued by an administrator.
+2. **Token Lifespans**: OAuth token lifetimes and expiration policies depend on the platform's authorization terms and application settings (for example, LinkedIn access token duration varies based on the authorization grant and developer policy). Users should inspect token expiry times and renew or re-authorize credentials as required.
 3. **Public Access Constraints**: Reddit and LinkedIn enforce platform-wide authentication walls or community membership gates. Consequently, `public_access` for these platforms is conservatively marked as `False`.
-4. **Third-Party Rate Limits**: High-frequency bulk publishing must account for platform rate limits (e.g. Telegram 30 msg/sec, Discord 5 requests/sec per webhook, Reddit 60 req/min).
+4. **Third-Party Rate Limits**: Platform rate limits vary significantly depending on the platform, account tier, API access level, and specific endpoint. High-frequency or bulk publishing must adhere to the official rate limits and backoff policies documented by each platform provider.
 
 ---
 
