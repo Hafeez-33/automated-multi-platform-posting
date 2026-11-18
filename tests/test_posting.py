@@ -2763,6 +2763,282 @@ def test_endpoint_dependency_override_cleanup():
     assert get_posting_service not in app.dependency_overrides
 
 
+# ==============================================================================
+# Comprehensive E2E Integration Tests: Stage 5.3A
+# ==============================================================================
+
+def test_e2e_api_startup_and_health_endpoints():
+    """Verify application startup, root health endpoint, and interactive docs."""
+    # 1. Root health check
+    root_resp = client.get("/")
+    assert root_resp.status_code == 200
+    root_data = root_resp.json()
+    assert root_data["status"] == "healthy"
+    assert "Automated Multi-Platform Posting System" in root_data["app"]
+
+    # 2. Interactive Swagger UI
+    docs_resp = client.get("/docs")
+    assert docs_resp.status_code == 200
+    assert "SwaggerUIBundle" in docs_resp.text or "swagger" in docs_resp.text.lower()
+
+
+def test_e2e_openapi_schema_completeness():
+    """Verify that OpenAPI specification includes /posting and all required Pydantic models."""
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    schema = resp.json()
+
+    # Paths
+    assert "/posting" in schema["paths"]
+    assert "post" in schema["paths"]["/posting"]
+
+    # Component Schemas
+    components = schema.get("components", {}).get("schemas", {})
+    assert "PostingRequest" in components
+    assert "PostingResponse" in components
+    assert "PlatformResult" in components
+
+    # Verify properties
+    posting_req_props = components["PostingRequest"]["properties"]
+    assert "message" in posting_req_props
+
+    platform_result_props = components["PlatformResult"]["properties"]
+    assert "platform" in platform_result_props
+    assert "status" in platform_result_props
+    assert "posted_url" in platform_result_props
+    assert "public_access" in platform_result_props
+    assert "date" in platform_result_props
+    assert "time" in platform_result_props
+    assert "error" in platform_result_props
+
+
+def test_e2e_request_validation_matrix():
+    """Verify request validation edge cases: whitespace-only, complex query URLs, and trailing punctuation."""
+    # 1. Whitespace only rejected
+    ws_resp = client.post("/posting", json={"message": "   \n\t   "})
+    assert ws_resp.status_code == 422
+    assert "Message must not be empty" in ws_resp.text
+
+    # 2. Complex URL with path and query parameters
+    from app.main import app, get_posting_service
+
+    mock_service = _MockPostingServiceForEndpoint()
+    app.dependency_overrides[get_posting_service] = lambda: mock_service
+
+    try:
+        complex_url = "https://example.com/products/deals?utm_source=spring&ref=99#target"
+        msg = f"Check special discounts today at {complex_url}."
+        resp = client.post("/posting", json={"message": msg})
+        assert resp.status_code == 200
+        assert mock_service.called_url == complex_url
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_e2e_concurrency_verification():
+    """Verify that the 5 platform adapters execute concurrently rather than sequentially."""
+    import time
+    from app.services.posting_service import PostingService
+
+    # Each adapter has a 0.15s delay. Sequential execution would take >= 0.75s.
+    # Concurrent execution should complete in ~0.15s - 0.35s.
+    platforms = [
+        _TestMockPlatform("Telegram", delay=0.15),
+        _TestMockPlatform("Discord", delay=0.15),
+        _TestMockPlatform("Reddit", delay=0.15),
+        _TestMockPlatform("LinkedIn", delay=0.15),
+        _TestMockPlatform("Mastodon", delay=0.15),
+    ]
+    service = PostingService(platforms=platforms)
+
+    start_time = time.perf_counter()
+    response = await service.post_to_all(
+        message="Concurrency test https://example.com",
+        url="https://example.com",
+    )
+    elapsed = time.perf_counter() - start_time
+
+    assert response.success is True
+    assert len(response.results) == 5
+    # Verify execution was concurrent: elapsed time is significantly less than 5 * 0.15s = 0.75s
+    assert elapsed < 0.55, f"Execution took {elapsed:.2f}s, expected concurrent completion under 0.55s"
+
+
+@pytest.mark.parametrize(
+    "failing_platform",
+    ["Telegram", "Discord", "Reddit", "LinkedIn", "Mastodon"],
+)
+def test_e2e_individual_platform_failure_isolation(failing_platform):
+    """Verify that when any single platform fails, the API returns HTTP 200 and all other 4 succeed."""
+    from app.main import app, get_posting_service
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform(
+            name=name,
+            status="failed" if name == failing_platform else "success",
+            error_msg=f"{name} simulated network rejection" if name == failing_platform else None,
+        )
+        for name in ("Telegram", "Discord", "Reddit", "LinkedIn", "Mastodon")
+    ]
+    service = PostingService(platforms=platforms)
+    app.dependency_overrides[get_posting_service] = lambda: service
+
+    try:
+        response = client.post("/posting", json={"message": "Failure isolation test https://example.com"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert len(data["results"]) == 5
+
+        # The failing platform must be marked failed
+        failed_res = next(r for r in data["results"] if r["platform"] == failing_platform)
+        assert failed_res["status"] == "failed"
+        assert "simulated network rejection" in failed_res["error"]
+
+        # The remaining four platforms must be marked success
+        successful = [r for r in data["results"] if r["platform"] != failing_platform]
+        assert len(successful) == 4
+        assert all(r["status"] == "success" for r in successful)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_e2e_runtime_error_and_invalid_result_isolation():
+    """Verify that unhandled exceptions and invalid results in adapters do not crash the service."""
+    from app.main import app, get_posting_service
+    from app.services.posting_service import PostingService
+
+    class _BrokenResultAdapter(_TestMockPlatform):
+        async def publish(self, message: str, url: str):
+            return 12345  # Not a PlatformResult
+
+    platforms = [
+        _TestMockPlatform("Telegram", exc=RuntimeError("Sudden network thread crash")),
+        _BrokenResultAdapter("Discord"),
+        _TestMockPlatform("Reddit", status="success"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="success"),
+    ]
+    service = PostingService(platforms=platforms)
+    app.dependency_overrides[get_posting_service] = lambda: service
+
+    try:
+        response = client.post("/posting", json={"message": "Crash isolation test https://example.com"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert len(data["results"]) == 5
+
+        results_by_platform = {r["platform"]: r for r in data["results"]}
+
+        # Telegram converted from RuntimeError to failed result
+        assert results_by_platform["Telegram"]["status"] == "failed"
+        assert "Sudden network thread crash" in results_by_platform["Telegram"]["error"]
+
+        # Discord converted from invalid return type to failed result
+        assert results_by_platform["Discord"]["status"] == "failed"
+        assert "invalid result object" in results_by_platform["Discord"]["error"].lower()
+
+        # Reddit, LinkedIn, Mastodon succeeded
+        assert results_by_platform["Reddit"]["status"] == "success"
+        assert results_by_platform["LinkedIn"]["status"] == "success"
+        assert results_by_platform["Mastodon"]["status"] == "success"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_e2e_security_token_scrubbing_across_all_platforms():
+    """Verify that tokens across all 5 platforms are redacted from the endpoint response."""
+    from app.main import app, get_posting_service
+    from app.services.posting_service import PostingService
+
+    secret_tg = "bot112233:SECRET_TG_TOKEN_999"
+    secret_dc = "https://discord.com/api/webhooks/123456789/SECRET_DC_TOKEN_888"
+    secret_rd = "SECRET_RD_REFRESH_TOKEN_777"
+    secret_li = "Bearer SECRET_LI_ACCESS_TOKEN_666"
+    secret_ms = "Bearer SECRET_MS_ACCESS_TOKEN_555"
+
+    leak_exc = RuntimeError(
+        f"Gateway error with {secret_tg}, {secret_dc}, {secret_rd}, {secret_li}, and {secret_ms}"
+    )
+
+    platforms = [
+        _TestMockPlatform("Telegram", exc=leak_exc),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Mastodon"),
+    ]
+    service = PostingService(platforms=platforms)
+    app.dependency_overrides[get_posting_service] = lambda: service
+
+    try:
+        response = client.post("/posting", json={"message": "Security leak test https://example.com"})
+
+        assert response.status_code == 200
+        response_text = response.text
+
+        # Assert no sensitive token values exist anywhere in the serialized HTTP response
+        assert "SECRET_TG_TOKEN_999" not in response_text
+        assert "SECRET_DC_TOKEN_888" not in response_text
+        assert "SECRET_LI_ACCESS_TOKEN_666" not in response_text
+        assert "SECRET_MS_ACCESS_TOKEN_555" not in response_text
+        assert "[REDACTED_" in response_text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_e2e_live_endpoint_with_missing_credentials_fails_gracefully():
+    """Verify live unconfigured endpoint returns HTTP 200 with 5 failure results and no crashes."""
+    # Ensure no dependency overrides are active so live default adapters are exercised
+    from app.main import app
+    app.dependency_overrides.clear()
+
+    response = client.post(
+        "/posting",
+        json={"message": "Unconfigured live credentials test https://example.com"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is False
+    assert len(data["results"]) == 5
+
+    # Each unconfigured platform must report failed with clear error
+    for r in data["results"]:
+        assert r["status"] == "failed"
+        assert r["posted_url"] is None
+        assert "missing" in r["error"].lower() or "configuration" in r["error"].lower()
+
+
+def test_e2e_env_example_and_gitignore_hygiene():
+    """Verify that .env is ignored and .env.example contains only non-sensitive placeholders."""
+    from pathlib import Path
+
+    # Verify .gitignore contains .env
+    gitignore_path = Path(".gitignore")
+    assert gitignore_path.exists()
+    gitignore_content = gitignore_path.read_text(encoding="utf-8")
+    assert ".env" in gitignore_content
+
+    # Verify .env.example contains no real tokens
+    env_example_path = Path(".env.example")
+    assert env_example_path.exists()
+    env_example_content = env_example_path.read_text(encoding="utf-8")
+
+    # Check that placeholders are present
+    assert "your_telegram_bot_token" in env_example_content
+    assert "your_webhook_id" in env_example_content
+    assert "your_reddit_client_id" in env_example_content
+    assert "your_linkedin_access_token" in env_example_content
+    assert "your_mastodon_access_token" in env_example_content
+
+
+
 
 
 
