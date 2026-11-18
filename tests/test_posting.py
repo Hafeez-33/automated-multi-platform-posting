@@ -1708,6 +1708,425 @@ async def test_linkedin_timestamp_handling(monkeypatch):
     assert result_no_ts.time is None
 
 
+# ==============================================================================
+# Unit Tests: MastodonPlatform Integration (Mocked HTTPX)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_mastodon_missing_credentials():
+    """Verify that MastodonPlatform fails gracefully when access token is missing."""
+    from app.platforms.mastodon import MastodonPlatform
+
+    platform = MastodonPlatform(access_token=None)
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Mastodon"
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date is None
+    assert result.time is None
+    assert "Missing required credentials" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_successful_public_status_creation(monkeypatch):
+    """Verify successful status creation with public visibility, valid URL, headers, and timestamp."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    captured_request = {}
+
+    async def mock_post(self, url, *args, **kwargs):
+        captured_request["url"] = url
+        captured_request["headers"] = kwargs.get("headers", {})
+        captured_request["json"] = kwargs.get("json", {})
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "113504829104829104",
+                "created_at": "2026-11-18T12:00:00.000Z",
+                "visibility": "public",
+                "url": "https://mastodon.social/@dxora/113504829104829104",
+                "uri": "https://mastodon.social/users/dxora/statuses/113504829104829104",
+                "content": "<p>Announcing Dxora platform! https://example.com</p>",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(
+        instance_url="https://mastodon.social",
+        access_token="test_mastodon_access_token_123",
+    )
+    result = await platform.publish(
+        message="Announcing Dxora platform! https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Mastodon"
+    assert result.status == "success"
+    assert result.posted_url == "https://mastodon.social/@dxora/113504829104829104"
+    assert result.public_access is True
+    assert result.date == datetime.date(2026, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+    assert result.error is None
+
+    # Verify endpoint, headers, and payload
+    assert captured_request["url"] == "https://mastodon.social/api/v1/statuses"
+    assert captured_request["headers"]["Authorization"] == "Bearer test_mastodon_access_token_123"
+    assert captured_request["headers"]["Content-Type"] == "application/json"
+    assert captured_request["json"] == {
+        "status": "Announcing Dxora platform! https://example.com",
+        "visibility": "public",
+    }
+
+
+def test_mastodon_url_normalization_function():
+    """Verify that normalize_instance_url safely handles missing schemes, trailing slashes, and spaces."""
+    from app.platforms.mastodon import normalize_instance_url
+
+    assert normalize_instance_url("https://mastodon.social") == "https://mastodon.social"
+    assert normalize_instance_url("https://mastodon.social/") == "https://mastodon.social"
+    assert normalize_instance_url("https://mastodon.social///") == "https://mastodon.social"
+    assert normalize_instance_url("mastodon.online") == "https://mastodon.online"
+    assert normalize_instance_url("  fosstodon.org/  ") == "https://fosstodon.org"
+    assert normalize_instance_url("http://local-fediverse:3000/") == "http://local-fediverse:3000"
+    assert normalize_instance_url("") == "https://mastodon.social"
+    assert normalize_instance_url(None) == "https://mastodon.social"
+
+
+@pytest.mark.asyncio
+async def test_mastodon_custom_instance_endpoint(monkeypatch):
+    """Verify that custom instance URLs are normalized and contacted without double slashes."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    captured_url = None
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal captured_url
+        captured_url = url
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "999",
+                "created_at": "2026-11-18T12:00:00.000Z",
+                "visibility": "public",
+                "url": "https://fosstodon.org/@dxora/999",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(
+        instance_url="https://fosstodon.org///",
+        access_token="tok",
+    )
+    result = await platform.publish("Custom instance https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert captured_url == "https://fosstodon.org/api/v1/statuses"
+    assert "//api" not in captured_url.replace("https://", "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned_visibility,expected_public",
+    [
+        ("public", True),
+        ("PUBLIC", True),
+        ("unlisted", False),
+        ("private", False),
+        ("direct", False),
+        ("unknown_custom_scope", False),
+        (None, False),
+    ],
+)
+async def test_mastodon_visibility_handling(monkeypatch, returned_visibility, expected_public):
+    """Verify that public_access is True ONLY when visibility is public, and False for unlisted/private/direct/unknown."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        payload = {
+            "id": "12345",
+            "url": "https://mastodon.social/@test/12345",
+        }
+        if returned_visibility is not None:
+            payload["visibility"] = returned_visibility
+        return httpx.Response(
+            status_code=200,
+            json=payload,
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.public_access is expected_public
+
+
+@pytest.mark.asyncio
+async def test_mastodon_http_401_unauthorized(monkeypatch):
+    """Verify that HTTP 401 returns failure with sanitized error message."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    secret_token = "confidential_mastodon_token_abc123"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=401,
+            json={"error": f"The access token {secret_token} is invalid"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token=secret_token)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "authentication failed" in result.error.lower()
+    assert "401" in result.error
+    assert secret_token not in result.error
+    assert "[REDACTED_ACCESS_TOKEN]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_http_403_forbidden(monkeypatch):
+    """Verify that HTTP 403 permission failures are clearly reported."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=403,
+            json={"error": "This action requires the write:statuses scope."},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "permission denied" in result.error.lower()
+    assert "403" in result.error
+    assert "write:statuses" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_http_422_validation_error(monkeypatch):
+    """Verify that HTTP 422 validation errors are clearly reported."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=422,
+            json={"error": "Validation failed: Text is too long"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "validation error" in result.error.lower()
+    assert "422" in result.error
+    assert "Validation failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_other_http_errors(monkeypatch):
+    """Verify that generic HTTP errors (e.g. 503 Service Unavailable) are handled cleanly."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=503,
+            text="Service Temporarily Unavailable",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "HTTP 503 error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_network_error(monkeypatch):
+    """Verify that network errors while contacting Mastodon instance are handled gracefully."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.ConnectError("Instance connection refused", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Mastodon network error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_request_timeout(monkeypatch):
+    """Verify that request timeouts return a clean failure result."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.TimeoutException("Connection to Mastodon instance timed out")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert result.error == "Mastodon request timed out."
+
+
+@pytest.mark.asyncio
+async def test_mastodon_malformed_response(monkeypatch):
+    """Verify that non-JSON response bodies return failure without crashing."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            text="<html>Bad Gateway</html>",
+            headers={"Content-Type": "text/html"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Failed to parse JSON" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_missing_or_invalid_status_url(monkeypatch):
+    """Verify that responses missing the status URL return failure without inventing URLs."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={"id": "123", "created_at": "2026-11-18T12:00:00Z"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "did not provide a valid status URL" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_mastodon_access_token_sanitization(monkeypatch):
+    """Verify that the secret Mastodon access token is never leaked in error messages."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    secret_token = "ultra_confidential_mastodon_bearer_token_777"
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.RequestError(
+            f"Failed to post to Mastodon with Authorization: Bearer {secret_token}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = MastodonPlatform(access_token=secret_token)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert secret_token not in result.error
+    assert "[REDACTED_ACCESS_TOKEN]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_mastodon_timestamp_parsing(monkeypatch):
+    """Verify timestamp parsing for ISO 8601 strings and clean None fallback."""
+    import httpx
+    from app.platforms.mastodon import MastodonPlatform
+
+    # 1. Valid timestamp
+    async def mock_post_valid(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "123",
+                "url": "https://mastodon.social/@test/123",
+                "visibility": "public",
+                "created_at": "2026-11-18T18:45:30.123456Z",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post_valid)
+    platform = MastodonPlatform(access_token="tok")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.date == datetime.date(2026, 11, 18)
+    assert result.time == datetime.time(18, 45, 30, 123456)
+
+    # 2. Invalid or missing timestamp produces None without guessing system time
+    async def mock_post_invalid(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "456",
+                "url": "https://mastodon.social/@test/456",
+                "visibility": "public",
+                "created_at": "invalid_date_format",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post_invalid)
+    result_invalid = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result_invalid.status == "success"
+    assert result_invalid.date is None
+    assert result_invalid.time is None
+
+
+
 
 
 
