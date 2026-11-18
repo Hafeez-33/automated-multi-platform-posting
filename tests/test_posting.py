@@ -2377,6 +2377,221 @@ async def test_posting_service_publish_alias():
     assert len(response.results) == 5
 
 
+def test_posting_service_empty_injected_platform_list():
+    """Verify that injecting an empty platform list raises a ValueError."""
+    from app.services.posting_service import PostingService
+
+    with pytest.raises(ValueError) as exc_info:
+        PostingService(platforms=[])
+
+    assert "empty" in str(exc_info.value).lower()
+    assert "exactly 5 platforms" in str(exc_info.value).lower()
+
+
+def test_posting_service_missing_platform():
+    """Verify that omitting one or more required platforms raises a descriptive ValueError."""
+    from app.services.posting_service import PostingService
+
+    incomplete_platforms = [
+        _TestMockPlatform("Telegram"),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        # Mastodon is missing
+    ]
+    with pytest.raises(ValueError) as exc_info:
+        PostingService(platforms=incomplete_platforms)
+
+    assert "missing required platforms" in str(exc_info.value).lower()
+    assert "Mastodon" in str(exc_info.value)
+
+
+def test_posting_service_duplicate_platform():
+    """Verify that providing duplicate platform adapters raises a ValueError."""
+    from app.services.posting_service import PostingService
+
+    duplicate_platforms = [
+        _TestMockPlatform("Telegram"),
+        _TestMockPlatform("Telegram"),  # Duplicate
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+    ]
+    with pytest.raises(ValueError) as exc_info:
+        PostingService(platforms=duplicate_platforms)
+
+    assert "duplicate platform" in str(exc_info.value).lower()
+    assert "Telegram" in str(exc_info.value)
+
+
+def test_posting_service_unexpected_platform_name():
+    """Verify that injecting an unrecognized or unsupported platform name raises a ValueError."""
+    from app.services.posting_service import PostingService
+
+    unexpected_platforms = [
+        _TestMockPlatform("Telegram"),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Twitter"),  # Unexpected platform
+    ]
+    with pytest.raises(ValueError) as exc_info:
+        PostingService(platforms=unexpected_platforms)
+
+    assert "unexpected platform 'twitter'" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_posting_service_incorrect_result_platform_name():
+    """Verify that if an adapter returns a PlatformResult with a mismatched platform name, it is marked failed."""
+    from app.services.posting_service import PostingService
+
+    class _MismatchedResultPlatform(_TestMockPlatform):
+        async def publish(self, message: str, url: str) -> PlatformResult:
+            return PlatformResult(
+                platform="Discord",  # Mismatched name! Should be Telegram
+                status="success",
+                posted_url="https://example.com/1",
+                public_access=True,
+                date=datetime.date(2026, 11, 18),
+                time=datetime.time(12, 0, 0),
+            )
+
+    platforms = [
+        _MismatchedResultPlatform("Telegram"),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Mastodon"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    telegram_res = next(r for r in response.results if r.platform == "Telegram")
+    assert telegram_res.status == "failed"
+    assert "mismatched platform name" in telegram_res.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_posting_service_invalid_adapter_result():
+    """Verify that non-PlatformResult return values (e.g. None or str) are converted to failed PlatformResult."""
+    from app.services.posting_service import PostingService
+
+    class _InvalidResultPlatform(_TestMockPlatform):
+        async def publish(self, message: str, url: str):
+            return "not_a_valid_platform_result_object"
+
+    platforms = [
+        _TestMockPlatform("Telegram"),
+        _InvalidResultPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Mastodon"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    discord_res = next(r for r in response.results if r.platform == "Discord")
+    assert discord_res.status == "failed"
+    assert "invalid result object" in discord_res.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_posting_service_exception_sanitization():
+    """Verify that unexpected exceptions never expose bot tokens, webhook secrets, or bearer tokens."""
+    from app.services.posting_service import PostingService
+
+    leaked_bot_token = "bot987654:ABCDEF_secret_telegram_token"
+    leaked_webhook = "https://discord.com/api/webhooks/1234567890/ultra_secret_webhook_token_999"
+    leaked_bearer = "Bearer super_secret_access_token_linkedin_xyz"
+
+    exc_text = (
+        f"Critical error on gateway: bot_token={leaked_bot_token}, "
+        f"webhook={leaked_webhook}, auth={leaked_bearer}"
+    )
+
+    platforms = [
+        _TestMockPlatform("Telegram", exc=RuntimeError(exc_text)),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Mastodon"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    telegram_res = next(r for r in response.results if r.platform == "Telegram")
+    assert telegram_res.status == "failed"
+
+    # Ensure none of the sensitive tokens or full webhook URLs are leaked
+    assert "ABCDEF_secret_telegram_token" not in telegram_res.error
+    assert "ultra_secret_webhook_token_999" not in telegram_res.error
+    assert "super_secret_access_token_linkedin_xyz" not in telegram_res.error
+    assert "[REDACTED_" in telegram_res.error
+
+
+@pytest.mark.asyncio
+async def test_posting_service_safe_fallback_handling(monkeypatch):
+    """Verify that exceptions escaping directly from asyncio.gather() are cleanly converted and sanitized."""
+    import asyncio
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram"),
+        _TestMockPlatform("Discord"),
+        _TestMockPlatform("Reddit"),
+        _TestMockPlatform("LinkedIn"),
+        _TestMockPlatform("Mastodon"),
+    ]
+    service = PostingService(platforms=platforms)
+
+    # Simulate asyncio.gather returning an unhandled Exception for the 3rd platform (Reddit)
+    original_gather = asyncio.gather
+
+    async def mock_gather(*tasks, **kwargs):
+        results = await original_gather(*tasks, **kwargs)
+        # Inject an Exception object as returned by return_exceptions=True
+        results[2] = RuntimeError("Direct gather exception with Bearer secret_bearer_token_123")
+        return results
+
+    monkeypatch.setattr(asyncio, "gather", mock_gather)
+
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    reddit_res = response.results[2]
+    assert reddit_res.platform == "Reddit"
+    assert reddit_res.status == "failed"
+    assert "secret_bearer_token_123" not in reddit_res.error
+    assert "[REDACTED_TOKEN]" in reddit_res.error
+
+
+@pytest.mark.asyncio
+async def test_posting_service_exactly_five_results_for_valid_configurations():
+    """Verify that any valid configuration returns exactly five PlatformResult items."""
+    from app.services.posting_service import PostingService
+
+    service = PostingService()
+    assert len(service.platforms) == 5
+    assert set(p.platform_name for p in service.platforms) == {
+        "Telegram",
+        "Discord",
+        "Reddit",
+        "LinkedIn",
+        "Mastodon",
+    }
+
+
+
 
 
 
