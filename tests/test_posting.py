@@ -240,3 +240,56 @@ async def test_concrete_platform_subclass_can_be_instantiated_and_executed():
     assert result.status == "success"
     assert result.public_access is True
 
+
+# ==============================================================================
+# Unit Tests: Settings & Configuration Alignment
+# ==============================================================================
+
+def test_settings_load_defaults_without_credentials():
+    """Verify that Settings can be instantiated when no platform credentials are provided."""
+    from app.config import Settings
+
+    test_settings = Settings(_env_file=None)
+
+    # Server defaults
+    assert test_settings.APP_NAME == "Automated Multi-Platform Posting System"
+    assert test_settings.PORT == 4000
+    assert test_settings.HOST == "0.0.0.0"
+
+    # Sensible platform defaults
+    assert test_settings.REDDIT_USER_AGENT == "AutomatedPoster/1.0.0"
+    assert test_settings.REDDIT_SUBREDDIT == "test"
+    assert test_settings.LINKEDIN_VERSION == "202411"
+    assert test_settings.MASTODON_INSTANCE_URL == "https://mastodon.social"
+
+    # Missing optional credentials must default to None without causing errors
+    assert test_settings.TELEGRAM_BOT_TOKEN is None
+    assert test_settings.TELEGRAM_CHAT_ID is None
+    assert test_settings.DISCORD_WEBHOOK_URL is None
+    assert test_settings.REDDIT_CLIENT_ID is None
+    assert test_settings.REDDIT_CLIENT_SECRET is None
+    assert test_settings.REDDIT_REFRESH_TOKEN is None
+    assert test_settings.REDDIT_ACCESS_TOKEN is None
+    assert test_settings.LINKEDIN_ACCESS_TOKEN is None
+    assert test_settings.LINKEDIN_AUTHOR_URN is None
+    assert test_settings.MASTODON_ACCESS_TOKEN is None
+
+
+def test_settings_override_via_arguments():
+    """Verify that settings can be customized through environment or constructor parameters."""
+    from app.config import Settings
+
+    custom_settings = Settings(
+        _env_file=None,
+        LINKEDIN_VERSION="202501",
+        REDDIT_SUBREDDIT="dxora_announcements",
+        TELEGRAM_CHAT_ID="@dxora_official",
+        MASTODON_INSTANCE_URL="https://mstdn.io",
+    )
+
+    assert custom_settings.LINKEDIN_VERSION == "202501"
+    assert custom_settings.REDDIT_SUBREDDIT == "dxora_announcements"
+    assert custom_settings.TELEGRAM_CHAT_ID == "@dxora_official"
+    assert custom_settings.MASTODON_INSTANCE_URL == "https://mstdn.io"
+
+
