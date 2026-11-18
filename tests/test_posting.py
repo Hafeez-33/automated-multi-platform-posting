@@ -1315,6 +1315,400 @@ def test_reddit_subreddit_normalization():
     assert normalize_subreddit(None) == "test"
 
 
+# ==============================================================================
+# Unit Tests: LinkedInPlatform Integration (Mocked HTTPX)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_linkedin_missing_credentials():
+    """Verify that LinkedInPlatform fails gracefully when access token or author URN is missing."""
+    from app.platforms.linkedin import LinkedInPlatform
+
+    platform = LinkedInPlatform(access_token=None, author_urn=None)
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "LinkedIn"
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date is None
+    assert result.time is None
+    assert "Missing required credentials" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_successful_member_post(monkeypatch):
+    """Verify successful publication for a member author with x-restli-id header and timestamp."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    captured_request = {}
+
+    async def mock_post(self, url, *args, **kwargs):
+        captured_request["url"] = url
+        captured_request["headers"] = kwargs.get("headers", {})
+        captured_request["json"] = kwargs.get("json", {})
+        return httpx.Response(
+            status_code=201,
+            headers={
+                "x-restli-id": "urn:li:share:7123456789012345678",
+                "Content-Type": "application/json",
+            },
+            json={"createdAt": 1731931200000},  # 2024-11-18 12:00:00 UTC in ms
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(
+        access_token="test_linkedin_access_token_123",
+        author_urn="urn:li:person:abcdef123",
+        linkedin_version="202611",
+    )
+    result = await platform.publish(
+        message="New release announced! https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "LinkedIn"
+    assert result.status == "success"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date == datetime.date(2024, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+    assert result.error is None
+
+    # Endpoint and headers verification
+    assert captured_request["url"] == "https://api.linkedin.com/rest/posts"
+    assert captured_request["headers"]["Authorization"] == "Bearer test_linkedin_access_token_123"
+    assert captured_request["headers"]["LinkedIn-Version"] == "202611"
+    assert captured_request["headers"]["X-Restli-Protocol-Version"] == "2.0.0"
+    assert captured_request["headers"]["Content-Type"] == "application/json"
+
+    # JSON payload verification
+    payload = captured_request["json"]
+    assert payload["author"] == "urn:li:person:abcdef123"
+    assert payload["commentary"] == "New release announced! https://example.com"
+    assert payload["visibility"] == "PUBLIC"
+    assert payload["lifecycleState"] == "PUBLISHED"
+    assert payload["isReshareDisabledByAuthor"] is False
+    assert payload["distribution"] == {
+        "feedDistribution": "MAIN_FEED",
+        "targetEntities": [],
+        "thirdPartyDistributionChannels": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_linkedin_successful_organization_post(monkeypatch):
+    """Verify that an organization URN author is correctly supported in the payload."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    captured_payload = None
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal captured_payload
+        captured_payload = kwargs.get("json", {})
+        return httpx.Response(
+            status_code=201,
+            headers={"x-restli-id": "urn:li:ugcPost:9988776655"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(
+        access_token="org_token",
+        author_urn="urn:li:organization:12345678",
+    )
+    result = await platform.publish("Company update https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert captured_payload is not None
+    assert captured_payload["author"] == "urn:li:organization:12345678"
+
+
+@pytest.mark.asyncio
+async def test_linkedin_configurable_api_version(monkeypatch):
+    """Verify that a custom LinkedIn API version is passed in the LinkedIn-Version header."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    captured_version = None
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal captured_version
+        captured_version = kwargs.get("headers", {}).get("LinkedIn-Version")
+        return httpx.Response(
+            status_code=201,
+            headers={"x-restli-id": "urn:li:share:111"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(
+        access_token="tok",
+        author_urn="urn:li:person:1",
+        linkedin_version="202706",
+    )
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert captured_version == "202706"
+
+
+@pytest.mark.asyncio
+async def test_linkedin_http_401_unauthorized(monkeypatch):
+    """Verify that HTTP 401 returns a failed PlatformResult with sanitized error description."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    secret_token = "confidential_linkedin_token_xyz"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=401,
+            json={"message": f"Token {secret_token} expired or invalid", "status": 401},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token=secret_token, author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "authentication failed" in result.error.lower()
+    assert "401" in result.error
+    assert secret_token not in result.error
+    assert "[REDACTED_ACCESS_TOKEN]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_http_403_forbidden(monkeypatch):
+    """Verify that HTTP 403 permission failures are clearly reported."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=403,
+            json={"message": "Not enough permissions to access /posts", "status": 403},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "permission denied" in result.error.lower()
+    assert "403" in result.error
+    assert "Not enough permissions" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_http_400_bad_request(monkeypatch):
+    """Verify that HTTP 400 validation errors return a clean failed result."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=400,
+            json={"message": "Invalid URN format for author", "status": 400},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="invalid_urn")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "validation error" in result.error.lower()
+    assert "400" in result.error
+    assert "Invalid URN" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_other_http_errors(monkeypatch):
+    """Verify that other HTTP errors (e.g. 500) are handled gracefully."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=500,
+            text="Internal Server Error",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "HTTP 500 error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_network_error(monkeypatch):
+    """Verify that connection/network errors are caught cleanly."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.ConnectError("Could not resolve host api.linkedin.com", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "LinkedIn network error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_request_timeout(monkeypatch):
+    """Verify that request timeouts return a clean failure result."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.TimeoutException("Read timeout on LinkedIn gateway")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert result.error == "LinkedIn request timed out."
+
+
+@pytest.mark.asyncio
+async def test_linkedin_missing_post_identifier(monkeypatch):
+    """Verify that responses missing the post identifier in headers and body return failure."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=201,
+            headers={"Content-Type": "application/json"},
+            json={},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "did not contain a valid post identifier" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_linkedin_malformed_response(monkeypatch):
+    """Verify that non-JSON response bodies without header post ID return failure without crashing."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            text="<html>Service Unavailable</html>",
+            headers={"Content-Type": "text/html"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Failed to parse JSON" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_access_token_sanitization(monkeypatch):
+    """Verify that the secret LinkedIn access token is never leaked in error messages."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    confidential_token = "secret_access_token_linkedin_987654"
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.RequestError(
+            f"Failed to send request with Authorization: Bearer {confidential_token}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = LinkedInPlatform(access_token=confidential_token, author_urn="urn:li:person:1")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert confidential_token not in result.error
+    assert "[REDACTED_ACCESS_TOKEN]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_linkedin_timestamp_handling(monkeypatch):
+    """Verify ISO string timestamp parsing and missing timestamp producing None."""
+    import httpx
+    from app.platforms.linkedin import LinkedInPlatform
+
+    # 1. Valid ISO string timestamp
+    async def mock_post_iso(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=201,
+            headers={"x-restli-id": "urn:li:share:123"},
+            json={"createdAt": "2026-11-18T14:30:00Z"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post_iso)
+    platform = LinkedInPlatform(access_token="tok", author_urn="urn:li:person:1")
+    result_iso = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result_iso.status == "success"
+    assert result_iso.date == datetime.date(2026, 11, 18)
+    assert result_iso.time == datetime.time(14, 30, 0)
+
+    # 2. Missing timestamp in response produces None without inventing system time
+    async def mock_post_no_ts(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=201,
+            headers={"x-restli-id": "urn:li:share:456"},
+            content=b"",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post_no_ts)
+    result_no_ts = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result_no_ts.status == "success"
+    assert result_no_ts.date is None
+    assert result_no_ts.time is None
+
+
+
 
 
 
