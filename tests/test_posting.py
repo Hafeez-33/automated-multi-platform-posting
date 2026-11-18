@@ -605,5 +605,232 @@ async def test_telegram_token_sanitization_in_errors(monkeypatch):
     assert "[REDACTED_BOT_TOKEN]" in result.error
 
 
+# ==============================================================================
+# Unit Tests: DiscordPlatform Integration (Mocked HTTPX)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_discord_missing_credentials():
+    """Verify that DiscordPlatform handles missing webhook URL gracefully."""
+    from app.platforms.discord import DiscordPlatform
+
+    platform = DiscordPlatform(webhook_url=None)
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Discord"
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date is None
+    assert result.time is None
+    assert "Missing DISCORD_WEBHOOK_URL" in result.error
+
+
+@pytest.mark.asyncio
+async def test_discord_successful_publication_with_guild_id(monkeypatch):
+    """Verify successful Discord publication with guild and channel IDs."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    fake_url = "https://discord.com/api/webhooks/123456789/dummy_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        assert "wait=true" in url
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "1307682949281726514",
+                "channel_id": "1199382103982910291",
+                "guild_id": "1199382000000000000",
+                "content": "Check out our platform https://example.com",
+                "timestamp": "2026-11-18T12:00:00.000000+00:00",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url=fake_url)
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Discord"
+    assert result.status == "success"
+    assert result.posted_url == "https://discord.com/channels/1199382000000000000/1199382103982910291/1307682949281726514"
+    assert result.public_access is False
+    assert result.date == datetime.date(2026, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_discord_successful_publication_without_guild_id(monkeypatch):
+    """Verify successful Discord publication when guild_id is omitted falls back to @me link."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    fake_url = "https://discord.com/api/webhooks/123456789/dummy_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "1307682949281726514",
+                "channel_id": "1199382103982910291",
+                "content": "Check out our platform https://example.com",
+                "timestamp": "2026-11-18T12:00:00.000000+00:00",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url=fake_url)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.posted_url == "https://discord.com/channels/@me/1199382103982910291/1307682949281726514"
+    assert result.public_access is False
+
+
+@pytest.mark.asyncio
+async def test_discord_api_rejection_http_error(monkeypatch):
+    """Verify that Discord HTTP errors (e.g. 401 Unauthorized) are handled cleanly."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    fake_url = "https://discord.com/api/webhooks/123456789/dummy_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=401,
+            json={"message": "401: Unauthorized", "code": 0},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url=fake_url)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "HTTP 401 error" in result.error
+    assert "Unauthorized" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_discord_network_error(monkeypatch):
+    """Verify that network errors while contacting Discord are caught gracefully."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.ConnectError("Network unreachable", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Discord network error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_discord_request_timeout(monkeypatch):
+    """Verify that request timeouts are caught cleanly."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.TimeoutException("Read timeout")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert result.error == "Discord request timed out."
+
+
+@pytest.mark.asyncio
+async def test_discord_missing_message_or_channel_id(monkeypatch):
+    """Verify that responses missing message id or channel id return failed status."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={"content": "Hello without id"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Missing 'id' or 'channel_id'" in result.error
+    assert result.posted_url is None
+
+
+@pytest.mark.asyncio
+async def test_discord_malformed_json_response(monkeypatch):
+    """Verify that non-JSON response bodies return failed status without crashing."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            text="<html>Bad Gateway</html>",
+            headers={"Content-Type": "text/html"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert "Failed to parse JSON" in result.error
+
+
+@pytest.mark.asyncio
+async def test_discord_webhook_token_sanitization(monkeypatch):
+    """Verify that the webhook secret token is never exposed in error messages."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    secret_token = "ultra_confidential_webhook_secret_998877"
+    full_url = f"https://discord.com/api/webhooks/123456789/{secret_token}"
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.RequestError(
+            f"Failed to post to {full_url}",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url=full_url)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert secret_token not in result.error
+    assert "[REDACTED_DISCORD" in result.error
+
+
+
 
 
