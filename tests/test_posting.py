@@ -670,7 +670,7 @@ async def test_discord_successful_publication_with_guild_id(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_discord_successful_publication_without_guild_id(monkeypatch):
-    """Verify successful Discord publication when guild_id is omitted falls back to @me link."""
+    """Verify that omitting guild_id sets posted_url=None and does not invent a message URL."""
     import httpx
     from app.platforms.discord import DiscordPlatform
 
@@ -694,8 +694,105 @@ async def test_discord_successful_publication_without_guild_id(monkeypatch):
     result = await platform.publish("Check https://example.com", "https://example.com")
 
     assert result.status == "success"
-    assert result.posted_url == "https://discord.com/channels/@me/1199382103982910291/1307682949281726514"
+    assert result.posted_url is None
     assert result.public_access is False
+    assert result.date == datetime.date(2026, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_discord_missing_timestamp_produces_none(monkeypatch):
+    """Verify that a missing timestamp sets date=None and time=None without substituting system time."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "1307682949281726514",
+                "channel_id": "1199382103982910291",
+                "guild_id": "1199382000000000000",
+                "content": "Hello",
+                # timestamp omitted
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.date is None
+    assert result.time is None
+
+
+@pytest.mark.asyncio
+async def test_discord_invalid_timestamp_produces_none(monkeypatch):
+    """Verify that an invalid timestamp sets date=None and time=None without raising errors."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "1307682949281726514",
+                "channel_id": "1199382103982910291",
+                "guild_id": "1199382000000000000",
+                "content": "Hello",
+                "timestamp": "not-a-valid-iso-timestamp",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url="https://discord.com/api/webhooks/1/token")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.date is None
+    assert result.time is None
+
+
+@pytest.mark.asyncio
+async def test_discord_wait_true_query_param_handling(monkeypatch):
+    """Verify that wait=false is replaced by wait=true while preserving other query parameters."""
+    import httpx
+    from app.platforms.discord import DiscordPlatform
+
+    input_url = "https://discord.com/api/webhooks/123/token?wait=false&thread_id=987&category=promo"
+    captured_url = None
+
+    async def mock_post(self, url, *args, **kwargs):
+        nonlocal captured_url
+        captured_url = url
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "1307682949281726514",
+                "channel_id": "1199382103982910291",
+                "guild_id": "1199382000000000000",
+                "timestamp": "2026-11-18T12:00:00.000000+00:00",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = DiscordPlatform(webhook_url=input_url)
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert captured_url is not None
+    assert "wait=true" in captured_url
+    assert "wait=false" not in captured_url
+    assert "thread_id=987" in captured_url
+    assert "category=promo" in captured_url
+
 
 
 @pytest.mark.asyncio

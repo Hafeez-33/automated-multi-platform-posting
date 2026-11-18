@@ -2,11 +2,31 @@
 
 import datetime
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 
 from app.config import settings
 from app.platforms.base import BasePlatform
 from app.schemas import PlatformResult
+
+
+def _ensure_wait_true(url: str) -> str:
+    """
+    Ensure the webhook URL contains wait=true query parameter using standard URL parsing.
+    Replaces existing wait=false if present, preserving all other query parameters.
+    """
+    parsed = urlparse(url)
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_params["wait"] = "true"
+    new_query = urlencode(query_params)
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment,
+    ))
 
 
 class DiscordPlatform(BasePlatform):
@@ -17,7 +37,7 @@ class DiscordPlatform(BasePlatform):
         webhook_url: Optional[str] = None,
         timeout: float = 10.0,
     ) -> None:
-        self.webhook_url = webhook_url or settings.DISCORD_WEBHOOK_URL
+        self.webhook_url = webhook_url if webhook_url is not None else settings.DISCORD_WEBHOOK_URL
         self.timeout = timeout
 
     @property
@@ -63,10 +83,7 @@ class DiscordPlatform(BasePlatform):
             )
 
         # 2. Prepare endpoint with wait=true to receive the Message object
-        target_url = self.webhook_url
-        if "wait=" not in target_url:
-            delimiter = "&" if "?" in target_url else "?"
-            target_url = f"{target_url}{delimiter}wait=true"
+        target_url = _ensure_wait_true(self.webhook_url)
 
         payload = {
             "content": message,
@@ -116,26 +133,25 @@ class DiscordPlatform(BasePlatform):
                     error="Discord unexpected response: Missing 'id' or 'channel_id' in response.",
                 )
 
-            # Publication timestamp
+            # Publication timestamp: parse when valid, otherwise None
+            pub_date: Optional[datetime.date] = None
+            pub_time: Optional[datetime.time] = None
             raw_timestamp = data.get("timestamp")
-            dt: Optional[datetime.datetime] = None
             if raw_timestamp and isinstance(raw_timestamp, str):
                 try:
                     dt = datetime.datetime.fromisoformat(raw_timestamp)
-                except ValueError:
-                    dt = datetime.datetime.now(datetime.timezone.utc)
-            else:
-                dt = datetime.datetime.now(datetime.timezone.utc)
+                    pub_date = dt.date()
+                    pub_time = dt.time()
+                except (ValueError, TypeError):
+                    pub_date = None
+                    pub_time = None
 
-            pub_date = dt.date()
-            pub_time = dt.time()
-
-            # Construct message URL if IDs are available
+            # Construct message URL only when guild_id, channel_id, and message_id are available
             guild_id = data.get("guild_id")
             if guild_id:
                 posted_url = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
             else:
-                posted_url = f"https://discord.com/channels/@me/{channel_id}/{message_id}"
+                posted_url = None
 
             # Discord channels require authentication and guild permissions to view
             public_access = False
