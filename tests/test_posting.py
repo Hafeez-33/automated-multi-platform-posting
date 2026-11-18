@@ -1,6 +1,7 @@
 """Tests for Pydantic schemas, input validation rules, and endpoint schema verification."""
 
 import datetime
+from typing import Optional
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -2124,6 +2125,257 @@ async def test_mastodon_timestamp_parsing(monkeypatch):
     assert result_invalid.status == "success"
     assert result_invalid.date is None
     assert result_invalid.time is None
+
+
+# ==============================================================================
+# Unit Tests: PostingService Orchestrator (Mocked Platforms)
+# ==============================================================================
+
+from app.platforms.base import BasePlatform
+
+
+class _TestMockPlatform(BasePlatform):
+    """Configurable mock platform for testing PostingService orchestration."""
+
+    def __init__(
+        self,
+        name: str,
+        status: str = "success",
+        delay: float = 0.0,
+        exc: Optional[Exception] = None,
+        error_msg: Optional[str] = None,
+    ) -> None:
+        self._name = name
+        self._status = status
+        self._delay = delay
+        self._exc = exc
+        self._error_msg = error_msg
+        self.call_count = 0
+
+    @property
+    def platform_name(self) -> str:
+        return self._name
+
+    async def publish(self, message: str, url: str) -> PlatformResult:
+        import asyncio
+
+        self.call_count += 1
+        if self._delay > 0:
+            await asyncio.sleep(self._delay)
+
+        if self._exc:
+            raise self._exc
+
+        if self._status == "success":
+            return PlatformResult(
+                platform=self._name,
+                status="success",
+                posted_url=f"https://{self._name.lower()}.example.com/posts/101",
+                public_access=True,
+                date=datetime.date(2026, 11, 18),
+                time=datetime.time(12, 0, 0),
+                error=None,
+            )
+        return PlatformResult(
+            platform=self._name,
+            status="failed",
+            posted_url=None,
+            public_access=False,
+            date=None,
+            time=None,
+            error=self._error_msg or f"{self._name} test error",
+        )
+
+
+def test_posting_service_default_platform_initialization():
+    """Verify that PostingService default constructor initializes all 5 platforms in order."""
+    from app.services.posting_service import PostingService
+
+    service = PostingService()
+    platform_names = [p.platform_name for p in service.platforms]
+    assert platform_names == ["Telegram", "Discord", "Reddit", "LinkedIn", "Mastodon"]
+    assert len(service.platforms) == 5
+
+
+@pytest.mark.asyncio
+async def test_posting_service_all_five_platforms_succeed():
+    """Verify that PostingResponse.success is True when all five platforms report success."""
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram", status="success"),
+        _TestMockPlatform("Discord", status="success"),
+        _TestMockPlatform("Reddit", status="success"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="success"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all(
+        message="Launch announcement https://example.com",
+        url="https://example.com",
+    )
+
+    assert response.success is True
+    assert len(response.results) == 5
+    assert [r.platform for r in response.results] == [
+        "Telegram",
+        "Discord",
+        "Reddit",
+        "LinkedIn",
+        "Mastodon",
+    ]
+    for r in response.results:
+        assert r.status == "success"
+        assert r.error is None
+        assert r.posted_url is not None
+
+
+@pytest.mark.asyncio
+async def test_posting_service_one_fails_four_succeed():
+    """Verify that if one platform fails, overall success is False while all 5 results are returned."""
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram", status="success"),
+        _TestMockPlatform("Discord", status="success"),
+        _TestMockPlatform("Reddit", status="failed", error_msg="Reddit rate limit exceeded"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="success"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    # Check Reddit failed while other 4 succeeded
+    reddit_res = next(r for r in response.results if r.platform == "Reddit")
+    assert reddit_res.status == "failed"
+    assert "rate limit" in reddit_res.error
+
+    success_platforms = [r.platform for r in response.results if r.status == "success"]
+    assert success_platforms == ["Telegram", "Discord", "LinkedIn", "Mastodon"]
+
+
+@pytest.mark.asyncio
+async def test_posting_service_multiple_platforms_fail():
+    """Verify that when multiple platforms fail, all results are gathered and success is False."""
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram", status="success"),
+        _TestMockPlatform("Discord", status="failed", error_msg="Discord 401 Unauthorized"),
+        _TestMockPlatform("Reddit", status="failed", error_msg="Reddit token expired"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="failed", error_msg="Mastodon connection refused"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    successful = [r.platform for r in response.results if r.status == "success"]
+    failed = [r.platform for r in response.results if r.status == "failed"]
+
+    assert successful == ["Telegram", "LinkedIn"]
+    assert failed == ["Discord", "Reddit", "Mastodon"]
+
+
+@pytest.mark.asyncio
+async def test_posting_service_all_five_platforms_fail():
+    """Verify that when all five platforms fail, success is False and all 5 failure results are returned."""
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram", status="failed", error_msg="Telegram 1"),
+        _TestMockPlatform("Discord", status="failed", error_msg="Discord 2"),
+        _TestMockPlatform("Reddit", status="failed", error_msg="Reddit 3"),
+        _TestMockPlatform("LinkedIn", status="failed", error_msg="LinkedIn 4"),
+        _TestMockPlatform("Mastodon", status="failed", error_msg="Mastodon 5"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+    assert all(r.status == "failed" for r in response.results)
+
+
+@pytest.mark.asyncio
+async def test_posting_service_unexpected_exception_isolation():
+    """Verify that an adapter raising an unhandled exception is isolated and does not abort others."""
+    from app.services.posting_service import PostingService
+
+    crash_exc = RuntimeError("Catastrophic platform adapter failure!")
+    platforms = [
+        _TestMockPlatform("Telegram", status="success"),
+        _TestMockPlatform("Discord", exc=crash_exc),  # Raises unhandled exception
+        _TestMockPlatform("Reddit", status="success"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="success"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is False
+    assert len(response.results) == 5
+
+    # Verify other 4 platforms ran to completion
+    for p in platforms:
+        assert p.call_count == 1
+
+    discord_res = next(r for r in response.results if r.platform == "Discord")
+    assert discord_res.status == "failed"
+    assert "Catastrophic platform adapter failure" in discord_res.error
+    assert "RuntimeError" in discord_res.error
+
+
+@pytest.mark.asyncio
+async def test_posting_service_deterministic_ordering_with_varying_latencies():
+    """Verify that results remain in deterministic platform order despite varying async completion times."""
+    from app.services.posting_service import PostingService
+
+    # Provide reverse latencies so later platforms complete first
+    platforms = [
+        _TestMockPlatform("Telegram", delay=0.05),
+        _TestMockPlatform("Discord", delay=0.01),
+        _TestMockPlatform("Reddit", delay=0.04),
+        _TestMockPlatform("LinkedIn", delay=0.02),
+        _TestMockPlatform("Mastodon", delay=0.03),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.post_to_all("Check https://example.com", "https://example.com")
+
+    assert response.success is True
+    assert len(response.results) == 5
+    assert [r.platform for r in response.results] == [
+        "Telegram",
+        "Discord",
+        "Reddit",
+        "LinkedIn",
+        "Mastodon",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_posting_service_publish_alias():
+    """Verify that the publish alias method behaves identically to post_to_all."""
+    from app.services.posting_service import PostingService
+
+    platforms = [
+        _TestMockPlatform("Telegram", status="success"),
+        _TestMockPlatform("Discord", status="success"),
+        _TestMockPlatform("Reddit", status="success"),
+        _TestMockPlatform("LinkedIn", status="success"),
+        _TestMockPlatform("Mastodon", status="success"),
+    ]
+    service = PostingService(platforms=platforms)
+    response = await service.publish("Check https://example.com", "https://example.com")
+
+    assert response.success is True
+    assert len(response.results) == 5
+
 
 
 
