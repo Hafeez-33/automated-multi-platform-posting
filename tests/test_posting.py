@@ -340,4 +340,270 @@ def test_linkedin_version_is_configurable(monkeypatch):
     assert arg_settings.LINKEDIN_VERSION == "202712"
 
 
+# ==============================================================================
+# Unit Tests: TelegramPlatform Integration (Mocked HTTPX)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_telegram_missing_credentials():
+    """Verify that TelegramPlatform handles missing credentials gracefully without crashing."""
+    from app.platforms.telegram import TelegramPlatform
+
+    platform = TelegramPlatform(bot_token=None, chat_id=None)
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Telegram"
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert result.date is None
+    assert result.time is None
+    assert "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" in result.error
+
+
+@pytest.mark.asyncio
+async def test_telegram_successful_publication_public_channel(monkeypatch):
+    """Verify successful Telegram publication with public channel URL generation."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    fake_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+
+    async def mock_post(self, url, *args, **kwargs):
+        assert fake_token in url
+        return httpx.Response(
+            status_code=200,
+            json={
+                "ok": True,
+                "result": {
+                    "message_id": 1042,
+                    "chat": {
+                        "id": -1001234567890,
+                        "title": "Dxora Public Channel",
+                        "username": "dxora_public",
+                        "type": "channel",
+                    },
+                    "date": 1731931200,
+                    "text": "Check out our platform https://example.com",
+                },
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token=fake_token, chat_id="@dxora_public")
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.platform == "Telegram"
+    assert result.status == "success"
+    assert result.posted_url == "https://t.me/dxora_public/1042"
+    assert result.public_access is True
+    assert result.date == datetime.date(2024, 11, 18)
+    assert result.time == datetime.time(12, 0, 0)
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_api_rejection(monkeypatch):
+    """Verify that Telegram API business-level errors (ok: false) are captured cleanly."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    fake_token = "secret_bot_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: chat not found",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token=fake_token, chat_id="@invalid_channel")
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.status == "failed"
+    assert result.posted_url is None
+    assert result.public_access is False
+    assert "Telegram API error: Bad Request: chat not found" in result.error
+    assert fake_token not in result.error
+
+
+@pytest.mark.asyncio
+async def test_telegram_http_status_error(monkeypatch):
+    """Verify that HTTP 4xx/5xx status errors are handled without unhandled exceptions."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    fake_token = "secret_bot_token"
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=403,
+            json={
+                "ok": False,
+                "error_code": 403,
+                "description": "Forbidden: bot was blocked by the user",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token=fake_token, chat_id="12345678")
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.status == "failed"
+    assert "HTTP 403 error" in result.error
+    assert "Forbidden: bot was blocked by the user" in result.error
+    assert fake_token not in result.error
+
+
+@pytest.mark.asyncio
+async def test_telegram_network_error(monkeypatch):
+    """Verify that network/connection errors are handled gracefully."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.ConnectError("Connection refused by peer", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token="test_token", chat_id="@dxora")
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.status == "failed"
+    assert "Telegram network error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_telegram_request_timeout(monkeypatch):
+    """Verify that request timeout exceptions are caught cleanly."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        raise httpx.TimeoutException("Read operation timed out")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token="test_token", chat_id="@dxora")
+    result = await platform.publish(
+        message="Check out our platform https://example.com",
+        url="https://example.com",
+    )
+
+    assert result.status == "failed"
+    assert result.error == "Telegram request timed out."
+
+
+@pytest.mark.asyncio
+async def test_telegram_public_channel_url_generation_from_chat_id(monkeypatch):
+    """Verify public channel URL generation when chat_id starts with @ even if chat.username is omitted."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "ok": True,
+                "result": {
+                    "message_id": 555,
+                    "chat": {"id": -10012345},  # username omitted in response
+                    "date": 1731931200,
+                },
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token="token", chat_id="@my_custom_channel")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.public_access is True
+    assert result.posted_url == "https://t.me/my_custom_channel/555"
+
+
+@pytest.mark.asyncio
+async def test_telegram_non_public_destination_behavior(monkeypatch):
+    """Verify that non-public destinations (numeric chat ID without username) have public_access=False and no posted_url."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    async def mock_post(self, url, *args, **kwargs):
+        return httpx.Response(
+            status_code=200,
+            json={
+                "ok": True,
+                "result": {
+                    "message_id": 888,
+                    "chat": {"id": -1009999999999, "type": "supergroup"},  # private group, no username
+                    "date": 1731931200,
+                },
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token="token", chat_id="-1009999999999")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "success"
+    assert result.public_access is False
+    assert result.posted_url is None
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_token_sanitization_in_errors(monkeypatch):
+    """Verify that sensitive bot tokens are never leaked into error messages."""
+    import httpx
+    from app.platforms.telegram import TelegramPlatform
+
+    secret_token = "987654321:SECRET_TOKEN_XYZ_123"
+
+    async def mock_post(self, url, *args, **kwargs):
+        # Simulate an exception string that accidentally includes the full request URL
+        raise httpx.RequestError(
+            f"Failed to connect to https://api.telegram.org/bot{secret_token}/sendMessage",
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+
+    platform = TelegramPlatform(bot_token=secret_token, chat_id="@test")
+    result = await platform.publish("Check https://example.com", "https://example.com")
+
+    assert result.status == "failed"
+    assert secret_token not in result.error
+    assert "[REDACTED_BOT_TOKEN]" in result.error
+
+
+
 
